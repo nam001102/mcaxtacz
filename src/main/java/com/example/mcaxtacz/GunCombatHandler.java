@@ -67,7 +67,10 @@ public class GunCombatHandler {
 
                     if (target != null && target.isAlive()) {
                         if (!(villager.distanceToSqr(target) > 2304.0D)) {
+                            // Clear MCA AI cooldowns so Guards fire continuously
                             villager.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
+                            villager.getBrain().eraseMemory(MemoryModuleType.ATTACK_COOLING_DOWN);
+
                             aimAt(villager, target, id);
 
                             long now = System.currentTimeMillis();
@@ -76,7 +79,7 @@ public class GunCombatHandler {
                             if (next == null || now >= next) {
                                 int currentAmmo = gun.getCurrentAmmoCount(mainHand);
 
-                                // 🔄 RELOAD MECHANIC
+                                // 🔄 RELOAD MECHANIC (Triggers when empty <= 0)
                                 if (currentAmmo <= 0) {
                                     ResourceLocation gunId = gun.getGunId(mainHand);
                                     Optional<GunData> gunDataOpt = TimelessAPI.getCommonGunIndex(gunId)
@@ -87,10 +90,12 @@ public class GunCombatHandler {
                                         ResourceLocation targetAmmoId = gunData.getAmmoId();
                                         Container villagerInv = villager.getInventory();
 
+                                        // 1. Scan villager inventory for matching ammo
                                         Optional<ItemStack> ammoInInv = InventoryUtils.stream(villagerInv)
                                                 .filter(stack -> !stack.isEmpty() && isMatchingAmmo(stack, targetAmmoId))
                                                 .findFirst();
 
+                                        // 2. If out of ammo, fetch from nearby chests
                                         if (ammoInInv.isEmpty()) {
                                             fetchAmmoFromNearbyChests(villager, targetAmmoId, gunData.getAmmoAmount());
                                             ammoInInv = InventoryUtils.stream(villagerInv)
@@ -99,23 +104,36 @@ public class GunCombatHandler {
                                         }
 
                                         if (ammoInInv.isPresent()) {
-                                            ItemStack ammo = ammoInInv.get();
+                                            ItemStack ammoStack = ammoInInv.get();
                                             int maxCapacity = gunData.getAmmoAmount();
-                                            int ammoToLoad = Math.min(ammo.getCount(), maxCapacity);
+                                            int ammoToLoad = Math.min(ammoStack.getCount(), maxCapacity);
 
-                                            ammo.shrink(ammoToLoad);
+                                            // 🟢 FIX RIFLE RELOAD:
+                                            // Deduct ammo from inventory
+                                            ammoStack.shrink(ammoToLoad);
 
-                                            // 🟢 UPDATE AMMO & SYNC CONTAINER SLOT IMMEDIATELY
+                                            // Update NBT ammo count
                                             gun.setCurrentAmmoCount(mainHand, ammoToLoad);
+
+                                            // Force sync slot 0 & save container state
                                             syncMainHandToContainer(villager, mainHand);
+                                            villagerInv.setChanged();
+
+                                            IGunOperator operator = IGunOperator.fromLivingEntity(villager);
+                                            if (isShotgunOrBolt(gun, mainHand)) {
+                                                operator.bolt();
+                                            }
 
                                             villager.swing(InteractionHand.MAIN_HAND);
                                             broadcastVillagerMessage(villager, "§eReloading!");
-                                            nextShotTime.put(id, now + 2500L);
+
+                                            long reloadTime = isShotgunOrBolt(gun, mainHand) ? 2800L : 2200L;
+                                            nextShotTime.put(id, now + reloadTime);
                                             return;
                                         }
                                     }
 
+                                    // Out of ammo in both inventory and chests
                                     villager.swing(InteractionHand.MAIN_HAND);
                                     broadcastVillagerMessage(villager, "§cOut of ammo!");
                                     nextShotTime.put(id, now + 3000L);
@@ -128,14 +146,43 @@ public class GunCombatHandler {
                                 float yaw = villager.getYRot();
 
                                 ShootResult result = operator.shoot(() -> pitch, () -> yaw);
-                                villager.swing(InteractionHand.MAIN_HAND);
+
+                                // 🟢 HANDLE BOLT ACTION / PUMP ACTION (Shotguns / Snipers)
+                                if (result == ShootResult.NEED_BOLT) {
+                                    operator.bolt();
+                                    syncMainHandToContainer(villager, mainHand);
+                                    nextShotTime.put(id, now + 500L);
+                                    return;
+                                }
 
                                 if (result == ShootResult.SUCCESS) {
-                                    // 🟢 DEDUCT AMMO & SYNC CONTAINER SLOT
-                                    gun.setCurrentAmmoCount(mainHand, currentAmmo - 1);
-                                    syncMainHandToContainer(villager, mainHand);
+                                    villager.swing(InteractionHand.MAIN_HAND);
+
+                                    boolean isPumpOrBolt = isShotgunOrBolt(gun, mainHand);
+
+                                    // 🟢 RIFLE AMMO DEDUCTION FIX:
+                                    // Read live stack from villager hand after shoot()
+                                    ItemStack updatedHand = villager.getMainHandItem();
+                                    int ammoAfterShoot = gun.getCurrentAmmoCount(updatedHand);
+
+                                    if (isPumpOrBolt) {
+                                        // Manual deduction for shotguns/bolt action
+                                        int newAmmo = Math.max(0, currentAmmo - 1);
+                                        gun.setCurrentAmmoCount(updatedHand, newAmmo);
+                                        syncMainHandToContainer(villager, updatedHand);
+                                    } else {
+                                        // For AKM / Automatic rifles:
+                                        // If TaCZ didn't auto-deduct NBT on Non-Player entity, deduct manually:
+                                        if (ammoAfterShoot == currentAmmo) {
+                                            int newAmmo = Math.max(0, currentAmmo - 1);
+                                            gun.setCurrentAmmoCount(updatedHand, newAmmo);
+                                        }
+                                        syncMainHandToContainer(villager, updatedHand);
+                                    }
 
                                     applyRecoilKick(id);
+
+                                    long shotDelay = isPumpOrBolt ? 750L : RAPID_FIRE_INTERVAL_MS;
 
                                     int left = shotsLeftInBurst.getOrDefault(id, randomBurstLength()) - 1;
                                     if (left <= 0) {
@@ -144,10 +191,10 @@ public class GunCombatHandler {
                                         shotsLeftInBurst.put(id, randomBurstLength());
                                     } else {
                                         shotsLeftInBurst.put(id, left);
-                                        nextShotTime.put(id, now + RAPID_FIRE_INTERVAL_MS);
+                                        nextShotTime.put(id, now + shotDelay);
                                     }
                                 } else {
-                                    nextShotTime.put(id, now + 150L);
+                                    nextShotTime.put(id, now + 100L);
                                 }
                             }
                         }
@@ -163,13 +210,23 @@ public class GunCombatHandler {
     }
 
     /**
-     * Force syncs the updated main-hand ItemStack back into MCA's inventory slot 0.
-     * Prevents item splitting and ghost duplicate creation.
+     * Checks if weapon is Pump-action, Bolt-action, or Shotgun archetype.
      */
-    private static void syncMainHandToContainer(VillagerEntityMCA villager, ItemStack mainHand) {
+    private static boolean isShotgunOrBolt(IGun gun, ItemStack stack) {
+        ResourceLocation gunId = gun.getGunId(stack);
+        if (gunId == null) return false;
+        String path = gunId.getPath().toLowerCase();
+        return path.contains("shotgun") || path.contains("m870") || path.contains("db")
+                || path.contains("sniper") || path.contains("kar98") || path.contains("bolt");
+    }
+
+    /**
+     * Forces container slot 0 to sync with the updated ItemStack and calls setChanged().
+     */
+    private static void syncMainHandToContainer(VillagerEntityMCA villager, ItemStack stack) {
         Container inventory = villager.getInventory();
         if (inventory.getContainerSize() > 0) {
-            inventory.setItem(0, mainHand);
+            inventory.setItem(0, stack);
             inventory.setChanged();
         }
     }
