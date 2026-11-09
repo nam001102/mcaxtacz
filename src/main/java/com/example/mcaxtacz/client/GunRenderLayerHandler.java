@@ -1,5 +1,7 @@
 package com.example.mcaxtacz.client;
 
+import com.example.mcaxtacz.mcaxtacz;
+
 import net.minecraft.client.renderer.ItemInHandRenderer;
 import net.minecraft.client.renderer.entity.EntityRenderer;
 import net.minecraft.client.renderer.entity.LivingEntityRenderer;
@@ -9,10 +11,10 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
-import net.neoforged.api.distmarker.Dist;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.client.event.EntityRenderersEvent;
+import net.minecraftforge.api.distmarker.Dist;
+import net.minecraftforge.client.event.EntityRenderersEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod.EventBusSubscriber;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,30 +23,30 @@ import java.lang.reflect.Method;
 import java.util.Set;
 
 @EventBusSubscriber(
-        modid = "mcaxtacz",
+        modid = mcaxtacz.MODID,
         value = {Dist.CLIENT}
 )
 public class GunRenderLayerHandler {
     private static final Logger LOGGER = LoggerFactory.getLogger(GunRenderLayerHandler.class);
 
-    // ResourceLocation trong 1.21.1 dùng ResourceLocation.fromNamespaceAndPath hoặc ResourceLocation.parse
     private static final Set<ResourceLocation> VILLAGER_ENTITY_IDS = Set.of(
-            ResourceLocation.fromNamespaceAndPath("mca", "male_villager"),
-            ResourceLocation.fromNamespaceAndPath("mca", "female_villager")
+            new ResourceLocation("mca", "male_villager"),
+            new ResourceLocation("mca", "female_villager")
     );
+
     @SubscribeEvent
     public static void onAddLayers(EntityRenderersEvent.AddLayers event) {
         for (ResourceLocation id : VILLAGER_ENTITY_IDS) {
-            // Thay ForgeRegistries.ENTITY_TYPES.getValue(id) -> BuiltInRegistries.ENTITY_TYPE.get(id)
             EntityType<?> type = BuiltInRegistries.ENTITY_TYPE.get(id);
 
             if (type == null) {
                 LOGGER.warn("Không tìm thấy EntityType với ID: {}", id);
             } else {
-                EntityRenderer<?> renderer = event.getRenderer(type);
+                // Safely retrieve renderer by casting the EntityType wildcard
+                EntityRenderer<?> renderer = getLivingRenderer(event, type);
 
                 if (renderer instanceof LivingEntityRenderer<?, ?> livingRenderer) {
-                    addItemInHandLayer(livingRenderer, event);
+                    addItemInHandLayer(livingRenderer, event.getContext().getItemInHandRenderer());
                 } else {
                     LOGGER.warn("Renderer của {} không phải là LivingEntityRenderer, không thể thêm ItemInHandLayer", id);
                 }
@@ -52,39 +54,31 @@ public class GunRenderLayerHandler {
         }
     }
 
-    @SuppressWarnings({"unchecked", "rawtypes"})
-    private static <T extends LivingEntity, M extends net.minecraft.client.model.EntityModel<T>> void addItemInHandLayer(
-            LivingEntityRenderer<?, ?> renderer,
-            EntityRenderersEvent.AddLayers event
-    ) {
+    @SuppressWarnings("unchecked")
+    private static EntityRenderer<?> getLivingRenderer(EntityRenderersEvent.AddLayers event, EntityType<?> type) {
         try {
-            // m_234598_() -> getItemInHandRenderer()
-            ItemInHandLayer layer = new ItemInHandLayer(
-                    (LivingEntityRenderer) renderer,
-                    event.getContext().getItemInHandRenderer()
-            );
+            // Cast wildcard EntityType to EntityType<? extends LivingEntity> to satisfy event signature
+            return event.getRenderer((EntityType<? extends LivingEntity>) type);
+        } catch (ClassCastException e) {
+            return null;
+        }
+    }
 
-            // Không cần Reflection nữa, gọi trực tiếp addLayer
-            ((LivingEntityRenderer) renderer).addLayer(layer);
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void addItemInHandLayer(LivingEntityRenderer<?, ?> renderer, ItemInHandRenderer itemInHandRenderer) {
+        try {
+            ItemInHandLayer layer = new ItemInHandLayer((LivingEntityRenderer) renderer, itemInHandRenderer);
+            invokeAddLayer(renderer, layer);
             LOGGER.info("Đã thêm thành công ItemInHandLayer vào MCA Renderer: {}", renderer.getClass().getSimpleName());
         } catch (Exception e) {
             LOGGER.error("Không thể thêm ItemInHandLayer vào MCA Renderer", e);
         }
     }
-    private static void addItemInHandLayer(LivingEntityRenderer<?, ?> renderer, ItemInHandRenderer itemInHandRenderer) {
-        try {
-            RenderLayer layer = new ItemInHandLayer(renderer, itemInHandRenderer);
-            invokeAddLayer(renderer, layer);
-        } catch (Exception e) {
-            LOGGER.error("No se pudo aÃ±adir la ItemInHandLayer al renderer de MCA", e);
-        }
-
-    }
 
     private static void invokeAddLayer(LivingEntityRenderer<?, ?> renderer, RenderLayer layer) throws Exception {
         Exception lastError = null;
 
-        for(String candidate : new String[]{"addLayer", "m_115326_"}) {
+        for (String candidate : new String[]{"addLayer", "m_115326_"}) {
             try {
                 Method addLayer = LivingEntityRenderer.class.getDeclaredMethod(candidate, RenderLayer.class);
                 addLayer.setAccessible(true);
@@ -95,6 +89,8 @@ public class GunRenderLayerHandler {
             }
         }
 
-        throw lastError;
+        if (lastError != null) {
+            throw lastError;
+        }
     }
 }

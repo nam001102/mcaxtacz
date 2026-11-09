@@ -14,8 +14,6 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 
-import net.conczin.mca.entity.VillagerEntityMCA;
-import net.conczin.mca.util.InventoryUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.Container;
@@ -24,24 +22,20 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.ai.Brain;
 import net.minecraft.world.entity.ai.memory.MemoryModuleType;
+import net.minecraft.world.entity.npc.Villager;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.event.entity.living.LivingEvent;
-import net.neoforged.neoforge.event.entity.living.LivingIncomingDamageEvent;
-import net.neoforged.neoforge.event.tick.EntityTickEvent;
+import net.minecraftforge.event.entity.living.LivingHurtEvent;
+import net.minecraftforge.event.entity.living.LivingEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod.EventBusSubscriber;
 
-@EventBusSubscriber(
-        modid = "mcaxtacz"
-)
+@EventBusSubscriber(modid = mcaxtacz.MODID)
 public class GunCombatHandler {
     private static final long RAPID_FIRE_INTERVAL_MS = 110L;
     private static final long BURST_PAUSE_MIN_MS = 350L;
     private static final long BURST_PAUSE_MAX_MS = 1100L;
-    private static final int BURST_MIN_SHOTS = 1;
-    private static final int BURST_MAX_SHOTS = 5;
     private static final double MAX_ENGAGE_RANGE = 48.0D;
 
     private static final Map<UUID, Long> nextShotTime = new ConcurrentHashMap<>();
@@ -49,15 +43,10 @@ public class GunCombatHandler {
     private static final Map<UUID, Float> recoilPitch = new ConcurrentHashMap<>();
     private static final Map<UUID, Float> recoilYaw = new ConcurrentHashMap<>();
 
-    private static final float RECOIL_KICK_PITCH = 4.0F;
-    private static final float RECOIL_KICK_YAW_MAX = 1.5F;
-    private static final float RECOIL_MAX_PITCH = 18.0F;
-    private static final float RECOIL_RECOVERY = 0.75F;
-
     @SubscribeEvent
-    public static void onEntityTick(EntityTickEvent.Pre event) {
+    public static void onEntityTick(LivingEvent.LivingTickEvent event) {
         Entity entity = event.getEntity();
-        if (entity instanceof VillagerEntityMCA villager) {
+        if (entity instanceof Villager villager && MCACompatibilityHelper.isMCAVillager(villager)) {
             if (!villager.level().isClientSide) {
                 ItemStack mainHand = villager.getMainHandItem();
 
@@ -67,7 +56,6 @@ public class GunCombatHandler {
 
                     if (target != null && target.isAlive()) {
                         if (!(villager.distanceToSqr(target) > 2304.0D)) {
-                            // Clear MCA AI cooldowns so Guards fire continuously
                             villager.getBrain().eraseMemory(MemoryModuleType.WALK_TARGET);
                             villager.getBrain().eraseMemory(MemoryModuleType.ATTACK_COOLING_DOWN);
 
@@ -79,7 +67,7 @@ public class GunCombatHandler {
                             if (next == null || now >= next) {
                                 int currentAmmo = gun.getCurrentAmmoCount(mainHand);
 
-                                // 🔄 RELOAD MECHANIC (Triggers when empty <= 0)
+                                // 🔄 RELOAD MECHANIC
                                 if (currentAmmo <= 0) {
                                     ResourceLocation gunId = gun.getGunId(mainHand);
                                     Optional<GunData> gunDataOpt = TimelessAPI.getCommonGunIndex(gunId)
@@ -88,52 +76,42 @@ public class GunCombatHandler {
                                     if (gunDataOpt.isPresent()) {
                                         GunData gunData = gunDataOpt.get();
                                         ResourceLocation targetAmmoId = gunData.getAmmoId();
-                                        Container villagerInv = villager.getInventory();
+                                        Container villagerInv = MCACompatibilityHelper.getMCAInventory(villager);
 
-                                        // 1. Scan villager inventory for matching ammo
-                                        Optional<ItemStack> ammoInInv = InventoryUtils.stream(villagerInv)
-                                                .filter(stack -> !stack.isEmpty() && isMatchingAmmo(stack, targetAmmoId))
-                                                .findFirst();
+                                        if (villagerInv != null) {
+                                            Optional<ItemStack> ammoInInv = findAmmoInContainer(villagerInv, targetAmmoId);
 
-                                        // 2. If out of ammo, fetch from nearby chests
-                                        if (ammoInInv.isEmpty()) {
-                                            fetchAmmoFromNearbyChests(villager, targetAmmoId, gunData.getAmmoAmount());
-                                            ammoInInv = InventoryUtils.stream(villagerInv)
-                                                    .filter(stack -> !stack.isEmpty() && isMatchingAmmo(stack, targetAmmoId))
-                                                    .findFirst();
-                                        }
-
-                                        if (ammoInInv.isPresent()) {
-                                            ItemStack ammoStack = ammoInInv.get();
-                                            int maxCapacity = gunData.getAmmoAmount();
-                                            int ammoToLoad = Math.min(ammoStack.getCount(), maxCapacity);
-
-                                            // 🟢 FIX RIFLE RELOAD:
-                                            // Deduct ammo from inventory
-                                            ammoStack.shrink(ammoToLoad);
-
-                                            // Update NBT ammo count
-                                            gun.setCurrentAmmoCount(mainHand, ammoToLoad);
-
-                                            // Force sync slot 0 & save container state
-                                            syncMainHandToContainer(villager, mainHand);
-                                            villagerInv.setChanged();
-
-                                            IGunOperator operator = IGunOperator.fromLivingEntity(villager);
-                                            if (isShotgunOrBolt(gun, mainHand)) {
-                                                operator.bolt();
+                                            if (ammoInInv.isEmpty()) {
+                                                fetchAmmoFromNearbyChests(villager, targetAmmoId, gunData.getAmmoAmount());
+                                                ammoInInv = findAmmoInContainer(villagerInv, targetAmmoId);
                                             }
 
-                                            villager.swing(InteractionHand.MAIN_HAND);
-                                            broadcastVillagerMessage(villager, "§eReloading!");
+                                            if (ammoInInv.isPresent()) {
+                                                ItemStack ammoStack = ammoInInv.get();
+                                                int maxCapacity = gunData.getAmmoAmount();
+                                                int ammoToLoad = Math.min(ammoStack.getCount(), maxCapacity);
 
-                                            long reloadTime = isShotgunOrBolt(gun, mainHand) ? 2800L : 2200L;
-                                            nextShotTime.put(id, now + reloadTime);
-                                            return;
+                                                ammoStack.shrink(ammoToLoad);
+                                                gun.setCurrentAmmoCount(mainHand, ammoToLoad);
+
+                                                syncMainHandToContainer(villager, mainHand);
+                                                villagerInv.setChanged();
+
+                                                IGunOperator operator = IGunOperator.fromLivingEntity(villager);
+                                                if (isShotgunOrBolt(gun, mainHand)) {
+                                                    operator.bolt();
+                                                }
+
+                                                villager.swing(InteractionHand.MAIN_HAND);
+                                                broadcastVillagerMessage(villager, "§eReloading!");
+
+                                                long reloadTime = isShotgunOrBolt(gun, mainHand) ? 2800L : 2200L;
+                                                nextShotTime.put(id, now + reloadTime);
+                                                return;
+                                            }
                                         }
                                     }
 
-                                    // Out of ammo in both inventory and chests
                                     villager.swing(InteractionHand.MAIN_HAND);
                                     broadcastVillagerMessage(villager, "§cOut of ammo!");
                                     nextShotTime.put(id, now + 3000L);
@@ -142,12 +120,18 @@ public class GunCombatHandler {
 
                                 // 🔫 FIRING MECHANIC
                                 IGunOperator operator = IGunOperator.fromLivingEntity(villager);
+
+                                int currentAmmoCheck = gun.getCurrentAmmoCount(mainHand);
+                                if (currentAmmoCheck <= 0) {
+                                    nextShotTime.put(id, now + 100L);
+                                    return;
+                                }
+
                                 float pitch = villager.getXRot();
                                 float yaw = villager.getYRot();
 
                                 ShootResult result = operator.shoot(() -> pitch, () -> yaw);
 
-                                // 🟢 HANDLE BOLT ACTION / PUMP ACTION (Shotguns / Snipers)
                                 if (result == ShootResult.NEED_BOLT) {
                                     operator.bolt();
                                     syncMainHandToContainer(villager, mainHand);
@@ -159,26 +143,13 @@ public class GunCombatHandler {
                                     villager.swing(InteractionHand.MAIN_HAND);
 
                                     boolean isPumpOrBolt = isShotgunOrBolt(gun, mainHand);
-
-                                    // 🟢 RIFLE AMMO DEDUCTION FIX:
-                                    // Read live stack from villager hand after shoot()
                                     ItemStack updatedHand = villager.getMainHandItem();
-                                    int ammoAfterShoot = gun.getCurrentAmmoCount(updatedHand);
 
-                                    if (isPumpOrBolt) {
-                                        // Manual deduction for shotguns/bolt action
-                                        int newAmmo = Math.max(0, currentAmmo - 1);
-                                        gun.setCurrentAmmoCount(updatedHand, newAmmo);
-                                        syncMainHandToContainer(villager, updatedHand);
-                                    } else {
-                                        // For AKM / Automatic rifles:
-                                        // If TaCZ didn't auto-deduct NBT on Non-Player entity, deduct manually:
-                                        if (ammoAfterShoot == currentAmmo) {
-                                            int newAmmo = Math.max(0, currentAmmo - 1);
-                                            gun.setCurrentAmmoCount(updatedHand, newAmmo);
-                                        }
-                                        syncMainHandToContainer(villager, updatedHand);
-                                    }
+                                    int liveAmmo = gun.getCurrentAmmoCount(updatedHand);
+                                    int newAmmo = Math.max(0, liveAmmo - 1);
+
+                                    gun.setCurrentAmmoCount(updatedHand, newAmmo);
+                                    syncMainHandToContainer(villager, updatedHand);
 
                                     applyRecoilKick(id);
 
@@ -209,9 +180,6 @@ public class GunCombatHandler {
         }
     }
 
-    /**
-     * Checks if weapon is Pump-action, Bolt-action, or Shotgun archetype.
-     */
     private static boolean isShotgunOrBolt(IGun gun, ItemStack stack) {
         ResourceLocation gunId = gun.getGunId(stack);
         if (gunId == null) return false;
@@ -220,18 +188,25 @@ public class GunCombatHandler {
                 || path.contains("sniper") || path.contains("kar98") || path.contains("bolt");
     }
 
-    /**
-     * Forces container slot 0 to sync with the updated ItemStack and calls setChanged().
-     */
-    private static void syncMainHandToContainer(VillagerEntityMCA villager, ItemStack stack) {
-        Container inventory = villager.getInventory();
-        if (inventory.getContainerSize() > 0) {
+    private static void syncMainHandToContainer(Villager villager, ItemStack stack) {
+        Container inventory = MCACompatibilityHelper.getMCAInventory(villager);
+        if (inventory != null && inventory.getContainerSize() > 0) {
             inventory.setItem(0, stack);
             inventory.setChanged();
         }
     }
 
-    private static void fetchAmmoFromNearbyChests(VillagerEntityMCA villager, ResourceLocation targetAmmoId, int amountNeeded) {
+    private static Optional<ItemStack> findAmmoInContainer(Container container, ResourceLocation targetAmmoId) {
+        for (int i = 0; i < container.getContainerSize(); i++) {
+            ItemStack stack = container.getItem(i);
+            if (!stack.isEmpty() && isMatchingAmmo(stack, targetAmmoId)) {
+                return Optional.of(stack);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static void fetchAmmoFromNearbyChests(Villager villager, ResourceLocation targetAmmoId, int amountNeeded) {
         BlockPos villagerPos = villager.blockPosition();
         int radius = 8;
 
@@ -245,7 +220,6 @@ public class GunCombatHandler {
                 for (int i = 0; i < container.getContainerSize(); i++) {
                     ItemStack stackInChest = container.getItem(i);
 
-                    // STRICT CHECK: Ensure item is valid ammo AND NOT a gun before moving it
                     if (!stackInChest.isEmpty() && isMatchingAmmo(stackInChest, targetAmmoId)) {
                         int countToTake = Math.min(stackInChest.getCount(), amountNeeded);
 
@@ -258,8 +232,24 @@ public class GunCombatHandler {
                         }
                         container.setChanged();
 
-                        // Insert taken ammo into inventory
-                        villager.getInventory().addItem(takenAmmo);
+                        Container villagerInv = MCACompatibilityHelper.getMCAInventory(villager);
+                        if (villagerInv != null) {
+                            // Add item to container safely
+                            for (int slot = 0; slot < villagerInv.getContainerSize(); slot++) {
+                                ItemStack slotItem = villagerInv.getItem(slot);
+                                if (slotItem.isEmpty()) {
+                                    villagerInv.setItem(slot, takenAmmo);
+                                    break;
+                                } else if (ItemStack.isSameItemSameTags(slotItem, takenAmmo) && slotItem.getCount() < slotItem.getMaxStackSize()) {
+                                    int space = slotItem.getMaxStackSize() - slotItem.getCount();
+                                    int toAdd = Math.min(space, takenAmmo.getCount());
+                                    slotItem.grow(toAdd);
+                                    takenAmmo.shrink(toAdd);
+                                    if (takenAmmo.isEmpty()) break;
+                                }
+                            }
+                            villagerInv.setChanged();
+                        }
 
                         broadcastVillagerMessage(villager, "§b[Looted ammo from chest]");
                         return;
@@ -273,28 +263,7 @@ public class GunCombatHandler {
         return ThreadLocalRandom.current().nextInt(1, 6);
     }
 
-//    private static void cleanDuplicateGunsInInventory(VillagerEntityMCA villager, ItemStack mainHandGun) {
-//        Container inventory = villager.getInventory();
-//
-//        for (int i = 0; i < inventory.getContainerSize(); i++) {
-//            ItemStack stack = inventory.getItem(i);
-//
-//            // Nếu tìm thấy item là súng
-//            if (!stack.isEmpty() && stack.getItem() instanceof IGun) {
-//                // 🛑 Bỏ qua khẩu súng Villager đang cầm trên tay
-//                // So sánh tham chiếu (stack == mainHandGun) hoặc so sánh slot
-//                if (stack == mainHandGun) {
-//                    continue;
-//                }
-//
-//                // Nếu không phải khẩu súng trên tay -> Đây là súng duplicate -> Xóa bỏ
-//                inventory.setItem(i, ItemStack.EMPTY);
-//                inventory.setChanged();
-//            }
-//        }
-//    }
-
-    private static void broadcastVillagerMessage(VillagerEntityMCA villager, String message) {
+    private static void broadcastVillagerMessage(Villager villager, String message) {
         villager.level().getEntitiesOfClass(
                 net.minecraft.world.entity.player.Player.class,
                 villager.getBoundingBox().inflate(16.0D)
@@ -306,19 +275,23 @@ public class GunCombatHandler {
                 )
         );
     }
+
     @SubscribeEvent
-    public static void onLivingIncomingDamage(LivingIncomingDamageEvent event) {
-        // getEntity(): Kẻ chịu trách nhiệm chính (Villager)
+    public static void onLivingHurt(LivingHurtEvent event) {
         Entity attacker = event.getSource().getEntity();
-        // getDirectEntity(): Thực thể trực tiếp gây sát thương (Villager nếu cận chiến, Viên đạn nếu bắn súng)
         Entity directAttacker = event.getSource().getDirectEntity();
 
-        if (attacker instanceof VillagerEntityMCA villager) {
+        if (attacker instanceof Villager villager && MCACompatibilityHelper.isMCAVillager(villager)) {
             ItemStack mainHandItem = villager.getMainHandItem();
 
-            if (mainHandItem.getItem() instanceof IGun) {
-                // CHỈ hủy sát thương nếu Villager trực tiếp va chạm cận chiến với mục tiêu.
-                // Nếu directAttacker != villager (tức là do viên đạn TaCZ bay vào), cho phép gây sát thương.
+            if (mainHandItem.getItem() instanceof IGun gun) {
+                int currentAmmo = gun.getCurrentAmmoCount(mainHandItem);
+                if (currentAmmo <= 0) {
+                    event.setCanceled(true);
+                    broadcastVillagerMessage(villager, "§c[Out of Ammo!]");
+                    return;
+                }
+
                 if (directAttacker == villager) {
                     event.setCanceled(true);
                 }
@@ -329,7 +302,6 @@ public class GunCombatHandler {
     private static boolean isMatchingAmmo(ItemStack stack, ResourceLocation targetAmmoId) {
         if (targetAmmoId == null || stack.isEmpty()) return false;
 
-        // ⛔ Đảm bảo ITEM KHÔNG PHẢI LÀ SÚNG để tránh nhân bản súng
         if (stack.getItem() instanceof IGun) {
             return false;
         }
@@ -341,18 +313,26 @@ public class GunCombatHandler {
         return false;
     }
 
-    private static Optional<LivingEntity> getAttackTarget(VillagerEntityMCA villager) {
+    private static Optional<LivingEntity> getAttackTarget(Villager villager) {
         Brain<?> brain = villager.getBrain();
-        return brain.getMemory(MemoryModuleType.ATTACK_TARGET);
+        Optional<LivingEntity> target = brain.getMemory(MemoryModuleType.ATTACK_TARGET);
+        if (target.isPresent()) {
+            return target;
+        }
+
+        // Fallback sang phương thức getTarget() truyền thống mà Archer sử dụng
+        LivingEntity mobTarget = villager.getTarget();
+        if (mobTarget != null && mobTarget.isAlive()) {
+            return Optional.of(mobTarget);
+        }
+
+        return Optional.empty();
     }
 
-    private static void aimAt(VillagerEntityMCA villager, LivingEntity target, UUID id) {
-        // m_146892_() -> getEyePosition()
+    private static void aimAt(Villager villager, LivingEntity target, UUID id) {
         Vec3 from = villager.getEyePosition();
-        // m_82546_() -> subtract()
         Vec3 diff = target.getEyePosition().subtract(from);
 
-        // f_82479_ -> x, f_82480_ -> y, f_82481_ -> z
         double horizontalDist = Math.sqrt(diff.x * diff.x + diff.z * diff.z);
 
         float baseYaw = (float) (Math.toDegrees(Math.atan2(diff.z, diff.x)) - 90.0F);
@@ -367,26 +347,20 @@ public class GunCombatHandler {
         float yaw = baseYaw + currentRecoilYaw;
         float pitch = basePitch - currentRecoilPitch;
 
-        // m_146922_() -> setYRot()
         villager.setYRot(yaw);
-        // m_146926_() -> setXRot()
         villager.setXRot(pitch);
 
-        // f_19859_ -> yRotO (Yaw vòng quay trước - dùng cho interpolation render)
         villager.yRotO = yaw;
-        // f_19860_ -> xRotO (Pitch vòng quay trước)
         villager.xRotO = pitch;
 
-        // f_20885_ -> yHeadRot (Góc xoay của đầu)
         villager.yHeadRot = yaw;
-        // f_20883_ -> yBodyRot (Góc xoay của thân)
         villager.yBodyRot = yaw;
     }
 
     private static void applyRecoilKick(UUID id) {
-        float newPitch = Math.min((Float)recoilPitch.getOrDefault(id, 0.0F) + 4.0F, 18.0F);
+        float newPitch = Math.min(recoilPitch.getOrDefault(id, 0.0F) + 4.0F, 18.0F);
         recoilPitch.put(id, newPitch);
-        float yawKick = (float)ThreadLocalRandom.current().nextDouble((double)-1.5F, (double)1.5F);
-        recoilYaw.put(id, (Float)recoilYaw.getOrDefault(id, 0.0F) + yawKick);
+        float yawKick = (float) ThreadLocalRandom.current().nextDouble(-1.5F, 1.5F);
+        recoilYaw.put(id, recoilYaw.getOrDefault(id, 0.0F) + yawKick);
     }
 }

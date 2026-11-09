@@ -4,54 +4,55 @@ import com.tacz.guns.api.TimelessAPI;
 import com.tacz.guns.api.entity.IGunOperator;
 import com.tacz.guns.api.item.IGun;
 
-import net.conczin.mca.entity.VillagerEntityMCA;
-import net.conczin.mca.util.InventoryUtils;
 import net.minecraft.world.Container;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.npc.Villager;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.event.entity.living.LivingEquipmentChangeEvent;
-import net.neoforged.neoforge.event.entity.living.LivingEvent;
-import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
-import net.neoforged.neoforge.event.tick.EntityTickEvent;
+import net.minecraftforge.event.entity.living.LivingEvent;
+import net.minecraftforge.event.entity.living.LivingEquipmentChangeEvent;
+import net.minecraftforge.event.entity.player.PlayerInteractEvent;
+import net.minecraftforge.eventbus.api.EventPriority;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod.EventBusSubscriber;
 
 import java.util.Optional;
 
-@EventBusSubscriber(
-        modid = "mcaxtacz"
-)
+@EventBusSubscriber(modid = mcaxtacz.MODID)
 public class GunEquipHandler {
-    private static final int NPC_AMMO_RESERVE = 9999;
 
-    @SubscribeEvent
+    // Ưu tiên HIGHEST để chặn hoàn toàn GUI của MCA khi player đang cầm súng trên tay
+    @SubscribeEvent(priority = EventPriority.HIGHEST)
     public static void onInteract(PlayerInteractEvent.EntityInteract event) {
         Entity target = event.getTarget();
 
-        if (target instanceof VillagerEntityMCA villager) {
+        if (target instanceof Villager villager && MCACompatibilityHelper.isMCAVillager(villager)) {
             Player player = event.getEntity();
             InteractionHand hand = event.getHand();
 
-            // m_21120_(hand) -> getItemInHand(hand)
             ItemStack held = player.getItemInHand(hand);
 
-            // m_41720_() -> getItem()
-            if (held.getItem() instanceof IGun) {
-                // m_9236_().m_5776_() -> level().isClientSide()
-                if (!villager.level().isClientSide()) {
-                    event.setCancellationResult(InteractionResult.SUCCESS);
-                    event.setCanceled(true);
+            if (!held.isEmpty() && held.getItem() instanceof IGun) {
+                // Chặn sự kiện ngay cả ở phía Client để ngắt lệnh mở GUI màn hình MCA
+                event.setCancellationResult(InteractionResult.SUCCESS);
+                event.setCanceled(true);
 
+                if (!villager.level().isClientSide()) {
+                    // 1. Kiểm tra súng cũ ở cả tay chính LẪN kho đồ MCA
+                    ItemStack currentMainHand = villager.getItemBySlot(EquipmentSlot.MAINHAND);
+
+                    // Xóa hoàn toàn súng cũ khỏi rương và trả lại cho người chơi
+                    clearAndReturnOldGuns(player, villager, currentMainHand);
+
+                    // 2. Trang bị súng mới
                     equipGun(villager, held);
 
-                    // m_150110_().f_35937_ -> getAbilities().instabuild
+                    // 3. Trừ 1 súng trên tay người chơi (nếu không ở Creative)
                     if (!player.getAbilities().instabuild) {
-                        // m_41774_(1) -> shrink(1)
                         held.shrink(1);
                     }
                 }
@@ -60,35 +61,30 @@ public class GunEquipHandler {
     }
 
     @SubscribeEvent
-    public static void onEntityTick(EntityTickEvent.Pre event) {
+    public static void onEntityTick(LivingEvent.LivingTickEvent event) {
         Entity entity = event.getEntity();
 
-        if (entity instanceof VillagerEntityMCA villager) {
-            // m_9236_().m_5776_() -> level().isClientSide()
+        if (entity instanceof Villager villager && MCACompatibilityHelper.isMCAVillager(villager)) {
             if (!villager.level().isClientSide()) {
-                // m_35311_() -> getInventory()
-                Container inventory = villager.getInventory();
+                Container inventory = MCACompatibilityHelper.getMCAInventory(villager);
+                if (inventory == null) return;
 
-                // Tìm khẩu súng đầu tiên trong túi đồ của Villager
-                // m_41720_() -> getItem()
-                Optional<ItemStack> bestGun = InventoryUtils.stream(inventory)
-                        .filter(stack -> stack.getItem() instanceof IGun)
-                        .findFirst();
-
-                // m_6844_(slot) -> getItemBySlot(slot)
                 ItemStack current = villager.getItemBySlot(EquipmentSlot.MAINHAND);
 
-                if (bestGun.isPresent()) {
-                    ItemStack gun = bestGun.get();
-                    boolean alreadyHoldingSameGun = current.getItem() instanceof IGun && current.getItem() == gun.getItem();
-
-                    if (!alreadyHoldingSameGun) {
-                        equipGun(villager, gun);
+                // Chỉ quét rương nếu tay chính chưa cầm súng
+                if (!(current.getItem() instanceof IGun)) {
+                    Optional<ItemStack> bestGun = Optional.empty();
+                    for (int i = 0; i < inventory.getContainerSize(); i++) {
+                        ItemStack stack = inventory.getItem(i);
+                        if (!stack.isEmpty() && stack.getItem() instanceof IGun) {
+                            bestGun = Optional.of(stack);
+                            break;
+                        }
                     }
-                } else if (current.getItem() instanceof IGun) {
-                    // m_8061_(slot, stack) -> setItemSlot(slot, stack)
-                    // f_41583_ -> ItemStack.EMPTY
-                    villager.setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
+
+                    if (bestGun.isPresent()) {
+                        equipGun(villager, bestGun.get());
+                    }
                 }
             }
         }
@@ -96,52 +92,109 @@ public class GunEquipHandler {
 
     @SubscribeEvent
     public static void onEquipmentChange(LivingEquipmentChangeEvent event) {
-        // getSlot() -> getSlot()
         if (event.getSlot() == EquipmentSlot.MAINHAND) {
-            // getEntity() -> getEntity()
-            if (event.getEntity() instanceof VillagerEntityMCA villager) {
-                // getFrom() -> getFrom()
+            if (event.getEntity() instanceof Villager villager && MCACompatibilityHelper.isMCAVillager(villager)) {
                 ItemStack from = event.getFrom();
-                // getTo() -> getTo()
                 ItemStack to = event.getTo();
 
-                // m_41720_() -> getItem()
-                // Nếu vật phẩm cũ là Súng và vật phẩm mới KHÔNG phải là Súng, bắt buộc giữ lại Súng
-                if (from.getItem() instanceof IGun && !(to.getItem() instanceof IGun)) {
-                    // m_8061_(slot, stack) -> setItemSlot(slot, stack)
-                    villager.setItemSlot(EquipmentSlot.MAINHAND, from);
+                // Ngăn MCA AI tước súng khi chuyển sang trạng thái nghỉ (non-combat)
+                if (!from.isEmpty() && from.getItem() instanceof IGun && !(to.getItem() instanceof IGun)) {
+                    // Kiểm tra xem có súng nào trong rương không, nếu không còn súng mới trả về từ
+                    Container inventory = MCACompatibilityHelper.getMCAInventory(villager);
+                    if (inventory != null) {
+                        boolean hasGunInInv = false;
+                        for (int i = 0; i < inventory.getContainerSize(); i++) {
+                            if (inventory.getItem(i).getItem() instanceof IGun) {
+                                hasGunInInv = true;
+                                break;
+                            }
+                        }
+                        if (hasGunInInv) {
+                            villager.setItemSlot(EquipmentSlot.MAINHAND, from);
+                        }
+                    }
                 }
             }
         }
     }
 
-    private static void equipGun(VillagerEntityMCA villager, ItemStack gunStack) {
-        // m_41777_() -> copy()
+    private static void equipGun(Villager villager, ItemStack gunStack) {
         ItemStack toEquip = gunStack.copy();
-
-        // m_41764_(1) -> setCount(1)
         toEquip.setCount(1);
 
         topUpAmmo(toEquip);
 
-        // m_8061_(slot, stack) -> setItemSlot(slot, stack)
+        // Gán vào tay chính
         villager.setItemSlot(EquipmentSlot.MAINHAND, toEquip);
-
-        // m_21409_(slot, dropChance) -> setDropChance(slot, dropChance)
-        // Thiết lập tỉ lệ rơi đồ khi chết là 0.0F (không rơi ra súng)
         villager.setDropChance(EquipmentSlot.MAINHAND, 0.0F);
 
-        // Khởi tạo/Đồng bộ dữ liệu thao tác súng cho Entity từ TaCZ
+        // Đồng bộ an toàn vào MCA Container
+        syncGunToContainer(villager, toEquip);
+
+        // Reset capability TaCZ
         IGunOperator.fromLivingEntity(villager).initialData();
+    }
+
+    /**
+     * Dọn dẹp sạch toàn bộ súng cũ trong rương lẫn trên tay, tránh việc MCA backup súng cũ
+     */
+    private static void clearAndReturnOldGuns(Player player, Villager villager, ItemStack mainHandGun) {
+        // 1. Trả súng trên tay chính cho người chơi nếu có
+        if (!mainHandGun.isEmpty() && mainHandGun.getItem() instanceof IGun) {
+            giveItemToPlayerOrDrop(player, villager, mainHandGun.copy());
+            villager.setItemSlot(EquipmentSlot.MAINHAND, ItemStack.EMPTY);
+        }
+
+        // 2. Quét rương MCA, trả bất kỳ khẩu súng dư thừa nào cho player và xóa sạch slot rương
+        Container inventory = MCACompatibilityHelper.getMCAInventory(villager);
+        if (inventory == null) return;
+
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack slotStack = inventory.getItem(i);
+            if (!slotStack.isEmpty() && slotStack.getItem() instanceof IGun) {
+                // Tránh trả trùng nếu nó chính là stack vừa trả ở tay chính
+                if (mainHandGun.isEmpty() || !ItemStack.matches(slotStack, mainHandGun)) {
+                    giveItemToPlayerOrDrop(player, villager, slotStack.copy());
+                }
+                inventory.setItem(i, ItemStack.EMPTY);
+            }
+        }
+        inventory.setChanged();
+    }
+
+    private static void syncGunToContainer(Villager villager, ItemStack gunStack) {
+        Container inventory = MCACompatibilityHelper.getMCAInventory(villager);
+        if (inventory == null) return;
+
+        // Tìm slot trống đầu tiên hoặc slot đã có súng đó để gán vào, không đè slot 0 vô điều kiện
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack slot = inventory.getItem(i);
+            if (slot.isEmpty() || slot.getItem() == gunStack.getItem()) {
+                inventory.setItem(i, gunStack);
+                inventory.setChanged();
+                return;
+            }
+        }
     }
 
     public static void topUpAmmo(ItemStack gunStack) {
         IGun iGun = IGun.getIGunOrNull(gunStack);
         if (iGun != null) {
-            int maxAmmo = (Integer) TimelessAPI.getCommonGunIndex(iGun.getGunId(gunStack)).map((index) -> index.getGunData().getAmmoAmount()).orElse(9999);
+            int maxAmmo = TimelessAPI.getCommonGunIndex(iGun.getGunId(gunStack))
+                    .map(index -> index.getGunData().getAmmoAmount())
+                    .orElse(9999);
+
             iGun.setCurrentAmmoCount(gunStack, maxAmmo);
             iGun.setBulletInBarrel(gunStack, true);
         }
     }
-}
 
+    private static void giveItemToPlayerOrDrop(Player player, Villager villager, ItemStack stack) {
+        if (stack.isEmpty()) return;
+        boolean added = player.getInventory().add(stack);
+        if (!added || !stack.isEmpty()) {
+            ItemEntity itemEntity = new ItemEntity(villager.level(), villager.getX(), villager.getY(), villager.getZ(), stack);
+            villager.level().addFreshEntity(itemEntity);
+        }
+    }
+}
